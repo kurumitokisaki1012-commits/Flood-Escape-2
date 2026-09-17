@@ -1,4 +1,4 @@
--- Movement panel v1.0
+-- Movement panel v1.1
 -- Standalone client script. Re-running replaces this panel and its listeners.
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
@@ -74,7 +74,7 @@ round(panel)
 
 local title = make("TextLabel", panel, {
     Size = UDim2.new(1, -48, 0, 38),
-    BackgroundTransparency = 1, Text = "Movement Panel",
+    BackgroundTransparency = 1, Text = "Movement Panel v1.1",
     TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold,
     TextSize = 16, Active = true,
 })
@@ -264,32 +264,113 @@ local function clickTeleport()
         return
     end
 
-    -- Offset the character's entire bounding box from the hit plane.
-    local box, size = character:GetBoundingBox()
+    -- Measure only body parts, excluding accessories and equipped tools.
+    local frame = root.CFrame
+    local low = Vector3.new(math.huge, math.huge, math.huge)
+    local high = Vector3.new(-math.huge, -math.huge, -math.huge)
+    for _, part in ipairs(character:GetChildren()) do
+        if part:IsA("BasePart") then
+            local half = part.Size / 2
+            for _, x in ipairs({-1, 1}) do
+                for _, y in ipairs({-1, 1}) do
+                    for _, z in ipairs({-1, 1}) do
+                        local point = frame:PointToObjectSpace(
+                            part.CFrame:PointToWorldSpace(
+                                Vector3.new(x * half.X, y * half.Y, z * half.Z)))
+                        low = Vector3.new(math.min(low.X, point.X),
+                            math.min(low.Y, point.Y), math.min(low.Z, point.Z))
+                        high = Vector3.new(math.max(high.X, point.X),
+                            math.max(high.Y, point.Y), math.max(high.Z, point.Z))
+                    end
+                end
+            end
+        end
+    end
+    local size = high - low
+    local box = frame * CFrame.new((low + high) / 2)
     local normal = hit.Normal
     local clearance =
         math.abs(normal:Dot(box.RightVector)) * size.X / 2
         + math.abs(normal:Dot(box.UpVector)) * size.Y / 2
         + math.abs(normal:Dot(box.LookVector)) * size.Z / 2
-    local center = hit.Position + normal * (clearance + 0.5)
-    local destinationBox = CFrame.new(center) * box.Rotation
+    local baseCenter = hit.Position + normal * (clearance + 0.2)
 
-    -- Conservative check against nearby solid parts.
+    -- Exact part-overlap query: wedges/meshes no longer block merely
+    -- because their enclosing bounding boxes intersect the destination.
+    local probe = Instance.new("Part")
+    probe.Name = "TeleportClearanceProbe"
+    probe.Size = size
+    probe.Anchored = true
+    probe.CanCollide = false
+    probe.CanTouch = false
+    probe.CanQuery = false
+    probe.Transparency = 1
+    probe.CFrame = box
+    probe.Parent = workspace
+
     local overlap = OverlapParams.new()
     overlap.FilterType = Enum.RaycastFilterType.Exclude
-    overlap.FilterDescendantsInstances = {character}
+    overlap.FilterDescendantsInstances = {character, probe}
     overlap.RespectCanCollide = true
     overlap.CollisionGroup = root.CollisionGroup
-    if #workspace:GetPartBoundsInBox(destinationBox, size, overlap) > 0 then
-        tpStatus.Text = "Status: Destination obstructed; try another point"
+    overlap.MaxParts = 1
+
+    -- Stay on the clicked side of the surface, including on slopes.
+    local tangentUp = Vector3.yAxis - normal * normal.Y
+    if tangentUp.Magnitude > 0.01 then
+        tangentUp = tangentUp.Unit
+    else
+        tangentUp = Vector3.zero
+    end
+    local candidates = {}
+    for _, outward in ipairs({0, 0.5, 1, 2, 3}) do
+        for _, lift in ipairs({0, 1, 2, 3, 4}) do
+            if lift == 0 or tangentUp.Magnitude > 0 then
+                local shift = normal * outward + tangentUp * lift
+                table.insert(candidates, {
+                    center = baseCenter + shift,
+                    distance = shift.Magnitude,
+                })
+            end
+        end
+    end
+    table.sort(candidates, function(a, b) return a.distance < b.distance end)
+
+    local destination
+    local blocker
+    local verticalRadius =
+        math.abs(box.RightVector.Y) * size.X / 2
+        + math.abs(box.UpVector.Y) * size.Y / 2
+        + math.abs(box.LookVector.Y) * size.Z / 2
+    local ok, problem = pcall(function()
+        for _, candidate in ipairs(candidates) do
+            if candidate.center.Y - verticalRadius >
+                workspace.FallenPartsDestroyHeight + 5 then
+                probe.CFrame = CFrame.new(candidate.center) * box.Rotation
+                local hits = workspace:GetPartsInPart(probe, overlap)
+                if #hits == 0 then
+                    destination = candidate.center
+                    break
+                end
+                blocker = hits[1].Name
+            end
+        end
+    end)
+    probe:Destroy()
+
+    if not ok then
+        tpStatus.Text = "Status: Clearance check failed"
+        warn("Teleport clearance: " .. tostring(problem))
         return
     end
-    local offset = center - box.Position
-    if root.Position.Y + offset.Y - size.Y / 2 <= workspace.FallenPartsDestroyHeight + 5 then
-        tpStatus.Text = "Status: Destination below map safety limit"
+    if not destination then
+        tpStatus.Text = blocker
+            and ("Status: No room near target (" .. blocker .. ")")
+            or "Status: Destination below map safety limit"
         return
     end
 
+    local offset = destination - box.Position
     character:PivotTo(character:GetPivot() + offset)
     root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
